@@ -1,0 +1,17 @@
+# 正式比赛配置（P0 最小版；性能与阈值按实测填，不预设）
+task: app                 # app | behavior | tool
+parser:
+  tcp_timeout: 300
+  udp_timeout: 60
+  max_packets: 500
+features:
+  max_features: 30
+selection:
+  enabled: true           # false = selection=none 对照
+rules:
+  confidence_threshold: 0.95
+  max_depth_candidates: [4, 6, 8]   # 验证集选，非验收门槛
+split:
+  group_by: capture_id    # 同组永不跨集合（P0 写死）
+  ratios: [0.6, 0.2, 0.2]
+  seed: 42

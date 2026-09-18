@@ -1,0 +1,269 @@
+{
+  "archive": {
+    "name": "1(1).zip",
+    "bytes": 10053219,
+    "sha256": "d8b129671578665f7feacebc6814971bb9f70faa5ac57ec8dee20c04f6df4515"
+  },
+  "inventory": {
+    "files": 102,
+    "python_files": 29,
+    "python_source_lines": 6777,
+    "pcap_files": []
+  },
+  "stored_artifacts": {
+    "engine_config": {
+      "confidence_threshold": 0.65,
+      "soft_match_threshold": 0.75,
+      "label_names": {
+        "0": "Geodo",
+        "1": "Gmail",
+        "2": "Miuref",
+        "3": "MySQL",
+        "4": "Tinba",
+        "5": "WorldOfWarcraft",
+        "6": "Zeus"
+      },
+      "num_classes": 7,
+      "num_features": 60,
+      "model_format": "xgboost_json"
+    },
+    "dpi_results_meta": {
+      "version": "1.0",
+      "engine": "OptimizedDPIEngine",
+      "confidence_threshold": 0.3,
+      "total_sessions": 420,
+      "correct": 416,
+      "above_threshold": 420
+    },
+    "true_label_counts": {
+      "WorldOfWarcraft": 60,
+      "MySQL": 60,
+      "Miuref": 60,
+      "Tinba": 60,
+      "Geodo": 60,
+      "Gmail": 60,
+      "Zeus": 60
+    },
+    "stored_accuracy": 0.9904761904761905,
+    "feature_records": 1260,
+    "first_record_keys": 320,
+    "feature_label_counts": {
+      "2": 180,
+      "1": 180,
+      "4": 180,
+      "3": 180,
+      "0": 180,
+      "6": 180,
+      "5": 180
+    }
+  },
+  "review_environment": {
+    "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+    "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+    "packages": {
+      "numpy": "2.3.5",
+      "pandas": "2.2.3",
+      "scipy": "1.17.0",
+      "scikit-learn": "1.8.0",
+      "xgboost": "3.1.3",
+      "PyYAML": "6.0.3",
+      "pytest": "9.0.2",
+      "cryptography": "46.0.4",
+      "scapy": null,
+      "dpkt": null,
+      "tqdm": "4.67.3"
+    }
+  },
+  "test_runs": {
+    "original_smoke": {
+      "exit_code": 0,
+      "reported_passed": 6,
+      "reported_total": 6,
+      "end_to_end_used_demo_fallback": true
+    },
+    "review_regressions": {
+      "exit_code": 1,
+      "total": 33,
+      "passed": 2,
+      "failed": 31,
+      "errors": 0,
+      "cases": [
+        {
+          "name": "test_control_microsecond_pcap_reads",
+          "status": "pass",
+          "message": ""
+        },
+        {
+          "name": "test_control_complete_clienthello_parses",
+          "status": "pass",
+          "message": ""
+        },
+        {
+          "name": "test_R01_initiator_direction_not_lexical_address",
+          "status": "fail",
+          "message": "AssertionError: SYN initiator must be forward regardless of address ordering"
+        },
+        {
+          "name": "test_R02_normal_tcp_data_not_marked_retransmission",
+          "status": "fail",
+          "message": "AssertionError: assert (not True)"
+        },
+        {
+          "name": "test_R03_reorder_does_not_count_same_wire_packet_twice",
+          "status": "fail",
+          "message": "AssertionError: assert (3 == 2)"
+        },
+        {
+          "name": "test_R04_udp_idle_timeout_is_applied_during_ingest",
+          "status": "fail",
+          "message": "AssertionError: assert 1 == 2"
+        },
+        {
+          "name": "test_R05_closed_tcp_state_is_reclaimed",
+          "status": "fail",
+          "message": "AssertionError: assert 1 == 0"
+        },
+        {
+          "name": "test_R06_zero_origin_timestamp_has_duration",
+          "status": "fail",
+          "message": "AssertionError: assert 0.0 == 2.0"
+        },
+        {
+          "name": "test_R07_nanosecond_pcap_timestamp",
+          "status": "fail",
+          "message": "ValueError: 不支持的文件格式: magic=0xa1b23c4d"
+        },
+        {
+          "name": "test_R08_big_endian_pcapng_not_silently_empty",
+          "status": "fail",
+          "message": "assert (0 == 1)"
+        },
+        {
+          "name": "test_R09_ethernet_padding_not_tcp_payload",
+          "status": "fail",
+          "message": "AssertionError: assert (6 == 0)"
+        },
+        {
+          "name": "test_R10_quic_short_header_never_discards_udp_packet",
+          "status": "fail",
+          "message": "assert (0 == 1)"
+        },
+        {
+          "name": "test_R11_quic_eight_byte_varint_masks_prefix",
+          "status": "fail",
+          "message": "assert (13835058055282163712, 8) == (0, 8)"
+        },
+        {
+          "name": "test_R12_fragmented_tcp_clienthello_preserves_sni",
+          "status": "fail",
+          "message": "assert (0.0 == 1.0)"
+        },
+        {
+          "name": "test_R13_truncated_clienthello_not_reported_complete",
+          "status": "fail",
+          "message": "AssertionError: NeedMoreData is allowed after API refactor; complete CH is not"
+        },
+        {
+          "name": "test_R14_ja3_ignores_grease",
+          "status": "fail",
+          "message": "AssertionError: assert '4df81e0d5386...b87203caff38d' == '2e0443b7419d...3d606919d035c'"
+        },
+        {
+          "name": "test_R15_uniform_byte_entropy_is_eight_bits",
+          "status": "fail",
+          "message": "assert -0.0 == 8.0 ± 8.0e-06"
+        },
+        {
+          "name": "test_R16_feature_schema_is_independent_of_packet_count",
+          "status": "fail",
+          "message": "AssertionError: only-short={'dir_2gram_6', 'dir_2gram_4', 'dir_2gram_7', 'dir_2gram_5'}, only-long={'burst_pkt_count_max', 'pkts_first_1.0s', 'num_bursts', 'burst_pkt_count_std', 'burst_pkt_count_mean', 'burst_duration_mean', 'pkts_first_0.5s', 'burst_duration_min', 'pkts_first_3.0s', 'burst_duration_max', 'pkts_first_5.0s', 'burst_duration_median', 'pkts_first_0.1s', 'burst_pkt_count_min', 'burst_duration_sum', 'burst_duration_std', 'burst_pkt_count_median', 'burst_pkt_count_sum'}"
+        },
+        {
+          "name": "test_R17_multiscale_aggregation_keeps_burst_timestamps",
+          "status": "fail",
+          "message": "assert (0.0 == 0.5 ± 5.0e-07"
+        },
+        {
+          "name": "test_R18_tree_path_requires_all_conditions",
+          "status": "fail",
+          "message": "AssertionError: assert [MatchResult(...h_score=0.75)] == []"
+        },
+        {
+          "name": "test_R19_not_exists_matches_missing_value",
+          "status": "fail",
+          "message": "assert 0 == 1"
+        },
+        {
+          "name": "test_R20_rule_output_obeys_configured_acceptance_threshold",
+          "status": "fail",
+          "message": "AssertionError: assert [MatchResult(...ch_score=1.0)] == []"
+        },
+        {
+          "name": "test_R21_class_zero_is_exported_like_other_classes",
+          "status": "fail",
+          "message": "AssertionError: assert {'B'} == {'A', 'B'}"
+        },
+        {
+          "name": "test_R22_missing_required_features_are_not_silently_zero_filled",
+          "status": "fail",
+          "message": "AssertionError: assert ([MatchResult(...ch_score=1.0)] == []"
+        },
+        {
+          "name": "test_R23_saved_dpi_labels_apply_rejection",
+          "status": "fail",
+          "message": "AssertionError: assert 'A' in ('unknown', 'UNKNOWN')"
+        },
+        {
+          "name": "test_R24_feature_extraction_does_not_mutate_original_session",
+          "status": "fail",
+          "message": "AssertionError: assert [(1.0, b'abcd....0, b'abcde')] == [(1.0, b'abcd....0, b'abcde')]"
+        },
+        {
+          "name": "test_R25_missing_input_fails_instead_of_generating_success",
+          "status": "fail",
+          "message": "Failed: DID NOT RAISE any of (<class 'FileNotFoundError'>, <class 'ValueError'>)"
+        },
+        {
+          "name": "test_R26_configuration_yaml_roundtrip",
+          "status": "fail",
+          "message": "yaml.constructor.ConstructorError: could not determine a constructor for the tag 'tag:yaml.org,2002:python/object/apply:pathlib._local.PosixPath'"
+        },
+        {
+          "name": "test_R27_validation_labels_keep_training_ids",
+          "status": "fail",
+          "message": "assert ([0, 0, 0] and {0} == {1}"
+        },
+        {
+          "name": "test_R28_real_mining_does_not_call_nonexistent_generator",
+          "status": "fail",
+          "message": "AssertionError: obsolete API called: 'OptimizedRuleGenerator' object has no attribute 'generate_rules'"
+        },
+        {
+          "name": "test_R29_threshold_search_counts_rejected_known_samples",
+          "status": "fail",
+          "message": "assert np.float64(0.9) == 0.5"
+        },
+        {
+          "name": "test_R30_truncated_prefix_duration_uses_observed_prefix",
+          "status": "fail",
+          "message": "assert np.float64(5.0) == 2.0 ± 2.0e-06"
+        },
+        {
+          "name": "test_R31_tree_leaf_labels_use_classes_mapping",
+          "status": "fail",
+          "message": "AssertionError: assert {'class_1'} == {'A', 'B'}"
+        }
+      ]
+    },
+    "unmocked_cli_mine": {
+      "synthetic": true,
+      "purpose": "valid PCAP container and generic UDP flow fixture for the existing mine CLI; not a real application or TLS/QUIC trace",
+      "packets": 144,
+      "flows": 32,
+      "sha256": "88509dd509b6bbce53ac26eaac050706e8bdeecee99772c8527e22ad6bb2a8bd",
+      "command": "python -m src.pipeline --mode mine --input review_real_input --output review_cli_run",
+      "exit_code": 1,
+      "expected_observed_exception": "AttributeError: 'OptimizedRuleGenerator' object has no attribute 'generate_rules'"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# 一键验收配置（scripts/run_acceptance.py）
+train_val_manifest: data/task/fixture_train_val.jsonl
+test_truth_manifest: data/task/fixture_test_truth.jsonl
+test_pcap_dir: output/fixture_m1/test
+regression_tests:
+  - tests/regression/test_review_regressions.py
+  - tests/test_contract_services.py

@@ -196,3 +196,47 @@ def test_label_window_mapping():
     assert label_window(r, 8.0, 13.0) == "voice_call"       # 重叠 60%
     assert label_window(r, 27.0, 32.0) == "voice_call"      # 重叠 60%
     assert label_window(r, 28.5, 33.5) == "background"      # 重叠 30% < 50%
+
+
+# ---------------------------------------------------------------------
+# dpi_infer 窗口模式一致性：behavior bundle 下 --pcap 与 --pcap-dir 同参
+# （2026-09-18 修复 --pcap 静默退化 app 会话模式后补的守门）
+# ---------------------------------------------------------------------
+@pytest.mark.skipif(
+    not Path(__file__).resolve().parents[1].joinpath(
+        "output", "p1_e2e", "mine", "bundle", "rules.json").exists(),
+    reason="p1_e2e behavior bundle 未生成")
+def test_behavior_bundle_single_pcap_matches_dir_mode(tmp_path):
+    """同一 behavior bundle 同一 pcap：单文件窗口推理 == 目录窗口推理。"""
+    import json as _json
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    bundle = root / "output" / "p1_e2e" / "mine" / "bundle"
+    pcap_dir = root / "output" / "fixture_m2" / "test"
+    pcaps = sorted(pcap_dir.glob("*.pcap"))
+    if not pcaps:
+        pytest.skip("fixture_m2 test pcaps 未生成")
+    pcap = pcaps[0]
+
+    def run(mode, target, out):
+        r = subprocess.run(
+            [sys.executable, "-m", "src.engine.dpi_infer",
+             "--rules", str(bundle), mode, str(target), "-o", str(out)],
+            cwd=str(root), capture_output=True, text=True, timeout=300)
+        assert r.returncode == 0, r.stderr[-300:]
+        return _json.loads(out.read_text())["results"]
+
+    single = run("--pcap", pcap, tmp_path / "single.json")
+    batch = [x for x in run("--pcap-dir", pcap_dir, tmp_path / "dir.json")
+             if x.get("source_file") == pcap.name]
+    # 单文件必须是窗口记录（含 window_start/end），不是会话记录
+    assert single and "window_start" in single[0], \
+        "behavior bundle 的 --pcap 未走窗口模式"
+    assert len(single) == len(batch)
+    for a, b in zip(single, batch):
+        assert a["observation_id"] == b["observation_id"]
+        assert abs(a["window_start"] - b["window_start"]) < 1e-9
+        assert abs(a["window_end"] - b["window_end"]) < 1e-9
+        assert a["predicted_label"] == b["predicted_label"], \
+            f"单文件/目录预测不一致: {a['predicted_label']} vs {b['predicted_label']}"
+        assert abs(a["confidence"] - b["confidence"]) < 1e-9

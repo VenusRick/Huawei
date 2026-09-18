@@ -720,3 +720,62 @@ class TestQuicThreeState:
         p = QUICParser()
         assert p.parse_packet(b'\xc3\x00') is None   # 不抛异常
         assert p.parse_packet(b'') is None
+
+
+# ---------------------------------------------------------------------
+# M3 revise-rules：结构化编辑校验/验证集回放/版本发布（原无自动覆盖，补）
+# ---------------------------------------------------------------------
+REV_BUNDLE = os.path.join(ROOT, 'output', 'p0_e2e', 'mine', 'bundle')
+REV_MANIFEST = os.path.join(ROOT, 'data', 'task', 'fixture_train_val.jsonl')
+
+
+@pytest.mark.skipif(not os.path.isdir(REV_BUNDLE), reason="p0_e2e bundle 未生成")
+class TestReviseRules:
+    """红线：非法编辑拒绝发布；原bundle不可变；新版本必须留回放diff证据。"""
+
+    def _run(self, tmp_path, edits):
+        import json as _json
+        import subprocess
+        from pathlib import Path as _Path
+        edits_f = _Path(tmp_path) / 'edits.json'
+        edits_f.write_text(_json.dumps(edits), encoding='utf-8')
+        out = _Path(tmp_path) / 'revised'
+        r = subprocess.run(
+            [sys.executable, '-m', 'src.pipeline', '--mode', 'revise-rules',
+             '--rules', REV_BUNDLE, '--edits', str(edits_f),
+             '--manifest', REV_MANIFEST, '--output', str(out)],
+            cwd=ROOT, capture_output=True, text=True, timeout=600)
+        return r, out
+
+    def test_illegal_edit_rejected_original_untouched(self, tmp_path):
+        """非法运算符（regex）必须拒绝且不发布，原 bundle 字节不变。"""
+        import json
+        from pathlib import Path
+        before = (Path(REV_BUNDLE) / 'rules.json').read_bytes()
+        edits = {"rules": [{"rule_id": "DT_0001", "action": "edit",
+                            "conditions": [
+                                {"feature": "duration", "op": "regex",
+                                 "value": "x"}]}]}
+        r, out = self._run(tmp_path, edits)
+        assert r.returncode != 0, "非法编辑被接受（红线）"
+        assert (Path(REV_BUNDLE) / 'rules.json').read_bytes() == before
+        assert not (out / 'bundle' / 'rules.json').exists()
+
+    def test_valid_disable_published_with_replay_diff(self, tmp_path):
+        """disable 发布为新版本：规则消失、meta 留源、回放 diff 有样本量。"""
+        import json
+        from pathlib import Path
+        before = (Path(REV_BUNDLE) / 'rules.json').read_bytes()
+        edits = {"rules": [{"rule_id": "DT_0001", "action": "disable"}]}
+        r, out = self._run(tmp_path, edits)
+        assert r.returncode == 0, r.stderr[-400:]
+        new = json.loads((out / 'bundle' / 'rules.json').read_text())
+        assert all(x.get('id') != 'DT_0001' for x in new)
+        cfg = json.loads((out / 'bundle' / 'bundle_config.json').read_text())
+        assert cfg.get('source') == 'revise-rules'
+        assert cfg.get('parent_bundle') == REV_BUNDLE
+        assert cfg.get('edits_applied') == 1
+        diff = json.loads((out / 'revision_diff.json').read_text())
+        assert diff['n_windows'] > 0, "验证集回放为空（未真正回放）"
+        # 原 bundle 未被覆盖
+        assert (Path(REV_BUNDLE) / 'rules.json').read_bytes() == before

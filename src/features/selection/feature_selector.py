@@ -140,13 +140,15 @@ class FeatureSelector:
         """计算特征重要性（XGBoost）"""
         try:
             from xgboost import XGBClassifier
+            from src.config import TRAIN_THREADS
             model = XGBClassifier(
                 n_estimators=100,
                 max_depth=6,
                 random_state=42,
                 use_label_encoder=False,
                 eval_metric='mlogloss',
-                verbosity=0
+                verbosity=0,
+                n_jobs=TRAIN_THREADS
             )
             X_filled = X.fillna(0)
             model.fit(X_filled, y)
@@ -154,8 +156,10 @@ class FeatureSelector:
         except Exception:
             try:
                 from sklearn.ensemble import RandomForestClassifier
+                from src.config import TRAIN_THREADS
                 model = RandomForestClassifier(
-                    n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+                    n_estimators=100, max_depth=10, random_state=42,
+                    n_jobs=TRAIN_THREADS
                 )
                 X_filled = X.fillna(0)
                 model.fit(X_filled, y)

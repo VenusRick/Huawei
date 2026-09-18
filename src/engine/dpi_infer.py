@@ -163,6 +163,8 @@ def main():
     # 加载引擎
     from src.engine.matcher.optimized_engine import OptimizedDPIEngine
     engine = OptimizedDPIEngine()
+    bundle_task = 'app'          # 默认 app；--rules 时按 bundle 配置覆盖
+    bundle_ctx = {}
     if args.rules:
         # 正式模式：独立规则推理（不加载预测器/训练库）
         engine.load_rule_bundle(args.rules)
@@ -195,9 +197,53 @@ def main():
     if args.pcap:
         # 单文件PCAP推理
         print(f"\n  PCAP: {args.pcap}")
-        features_list = extract_features_from_pcap(args.pcap, args.max_packets)
-        print(f"  提取: {len(features_list)} 个会话")
-        infer_features(engine, features_list, args.output)
+        if bundle_task == 'behavior':
+            # M2: behavior bundle 必须走窗口模式（与训练端同参重算），
+            # 否则单文件路径静默退化为 app 会话模式，口径不一致
+            from src.features.runtime import extract_behavior_feature_records
+            wrecs = extract_behavior_feature_records(
+                args.pcap, bundle_ctx, terminal=args.terminal)
+            print(f"  提取: {len(wrecs)} 个窗口")
+            all_results = []
+            for w in wrecs:
+                feats = {k: (v if v is not None else -1.0)
+                         for k, v in w.features.items()}
+                matches = engine.match(feats)
+                if matches:
+                    m = matches[0]
+                    all_results.append({
+                        'observation_id': w.observation.observation_id,
+                        'source_file': Path(args.pcap).name,
+                        'window_start': w.observation.window_start,
+                        'window_end': w.observation.window_end,
+                        'predicted_label': m.result,
+                        'confidence': round(m.confidence, 6),
+                        'source': m.source,
+                    })
+                else:
+                    all_results.append({
+                        'observation_id': w.observation.observation_id,
+                        'source_file': Path(args.pcap).name,
+                        'window_start': w.observation.window_start,
+                        'window_end': w.observation.window_end,
+                        'predicted_label': 'unknown',
+                        'confidence': 0.0, 'source': 'no_match'})
+            if args.output:
+                output = {
+                    'version': '1.0',
+                    'engine': 'OptimizedDPIEngine',
+                    'total_sessions': len(all_results),
+                    'results': all_results,
+                }
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    json.dump(output, f, indent=2, ensure_ascii=False)
+                print(f"\n  输出文件: {args.output}")
+            print(f"\n  窗口推理: {len(all_results)} 个窗口, "
+                  f"{sum(1 for r in all_results if r['predicted_label'] != 'unknown')} 个已识别")
+        else:
+            features_list = extract_features_from_pcap(args.pcap, args.max_packets)
+            print(f"  提取: {len(features_list)} 个会话")
+            infer_features(engine, features_list, args.output)
 
     elif args.pcap_dir:
         # 批量PCAP推理

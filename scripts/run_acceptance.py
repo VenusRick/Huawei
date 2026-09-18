@@ -47,11 +47,15 @@ def _semantic(results):
         sort_keys=True)
 
 
-def check_g01(results, cfg):
+def check_g01(results, cfg, run_dir):
     g = _status(results, "G01_regression")
     ok = True
+    # basetemp 收敛到本次验收目录：机器上他用户遗留的 /tmp/pytest-of-* 不会污染取证
+    basetemp = run_dir / ".pytest-tmp"
+    basetemp.mkdir(parents=True, exist_ok=True)
     for t in cfg["regression_tests"]:
-        r = subprocess.run([PY, "-m", "pytest", t, "-q"],
+        r = subprocess.run([PY, "-m", "pytest", t, "-q",
+                            "--basetemp", str(basetemp)],
                            cwd=str(ROOT), capture_output=True, text=True,
                            timeout=900)
         tail = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
@@ -246,7 +250,7 @@ def main():
         sys.exit(2)
     run_dir.mkdir(parents=True)
     results = {}
-    check_g01(results, cfg)
+    check_g01(results, cfg, run_dir)
     bundle = check_g02(results, cfg, run_dir)
     pred = check_g04(results, cfg, bundle, run_dir)
     check_g05(results, cfg, pred, run_dir)

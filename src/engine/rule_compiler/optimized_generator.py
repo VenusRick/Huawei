@@ -52,6 +52,7 @@ class OptimizedRuleGenerator:
         X_sel = X[selected_features].fillna(0)
 
         # 1. 训练XGBoost集成分类器
+        from src.config import TRAIN_THREADS
         self.classifier = XGBClassifier(
             n_estimators=200,
             max_depth=6,
@@ -63,6 +64,7 @@ class OptimizedRuleGenerator:
             use_label_encoder=False,
             eval_metric='mlogloss',
             verbosity=0,
+            n_jobs=TRAIN_THREADS,
         )
         self.classifier.fit(X_sel, y)
 

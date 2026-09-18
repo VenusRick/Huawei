@@ -4,7 +4,13 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from pathlib import Path
+import os
 import yaml
+
+# 训练侧线程上限：XGBoost/sklearn 默认吃满全部核，在多核共享机上造成
+# OpenMP 超额订阅（64核曾见193线程互踩、wall-time 数倍劣化）。
+# 数据规模（千级会话）下 8 线程已够；TRAIN_THREADS 环境变量可覆盖。
+TRAIN_THREADS = max(1, int(os.environ.get('TRAIN_THREADS', min(8, os.cpu_count() or 1))))
 
 
 @dataclass

@@ -61,21 +61,26 @@ def test_call_count_only_active_called():
 
 @pytest.mark.skipif(not (FIXTURE / "test" / "appA").exists(),
                     reason="fixture 未生成")
-def test_on_demand_output_parity():
-    """全算 vs --on-demand：同 bundle 同 pcap 预测语义一致。"""
+def test_on_demand_output_parity(tmp_path):
+    """全算 vs --on-demand：同 bundle 同 pcap 预测语义一致。
+
+    输出路径用 tmp_path，避免固定 /tmp 路径被他进程遗留文件占用
+    （stale 文件导致 PermissionError 且测试互相污染）。
+    """
     bundle = ROOT / "output" / "p0_e2e" / "mine" / "bundle"
     if not bundle.exists():
         pytest.skip("p0_e2e bundle 不存在")
     pcap = sorted((FIXTURE / "test" / "appA").glob("*.pcap"))[0]
+    out_path = tmp_path / "od_par.json"
 
     def run(extra):
         r = subprocess.run(
             [sys.executable, "-m", "src.engine.dpi_infer",
              "--rules", str(bundle), "--pcap", str(pcap),
-             "-o", "/tmp/od_par.json"] + extra,
+             "-o", str(out_path)] + extra,
             cwd=str(ROOT), capture_output=True, text=True, timeout=300)
         assert r.returncode == 0, r.stderr[-300:]
-        return json.loads(Path("/tmp/od_par.json").read_text())["results"]
+        return json.loads(out_path.read_text())["results"]
 
     full = run([])
     ondm = run(["--on-demand"])

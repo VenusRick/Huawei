@@ -43,6 +43,10 @@ class PCAPReader:
         self.total_quic_packets = 0
         self.parse_errors = 0
         self.tls_buffer_evicted = 0
+        # 读包上限证据（read_pcap 每次调用重置）
+        self.read_capped = False
+        self.packets_last_read = 0
+        self.first_timestamp: Optional[float] = None
 
         # TCP异常统计（从会话累加）
         self.total_retransmissions = 0
@@ -53,133 +57,219 @@ class PCAPReader:
         # TLS record跨分段重组缓冲: (src_ip,src_port,dst_ip,dst_port) -> bytes
         self._tls_buffers: dict = {}
 
-    def _read_packets(self, file_path: str):
+    def _read_packets(self, file_path: str, max_read_packets: Optional[int] = None):
         """
         通用包生成器，自动识别PCAP/PCAPNG格式。
         每次 yield (pkt_data, timestamp, link_type)。
+
+        max_read_packets: 真正的读包上限——达到后停止读取（不是读完再截）。
+        PCAP 按包头增量读文件；PCAPNG 按块增量读文件（2026-09-18 第二轮：
+        不再整文件载入，section 字节序/接口表状态跨块保持）。
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"PCAP文件不存在: {file_path}")
+        if max_read_packets is not None and max_read_packets <= 0:
+            raise ValueError(f"max_read_packets 必须为正整数: {max_read_packets}")
 
         with open(file_path, 'rb') as f:
-            data = f.read()
+            head = f.read(8)
+            if len(head) < 8:
+                return
+            magic = struct.unpack('<I', head[0:4])[0]
 
-        if len(data) < 8:
+            if magic in (0xa1b2c3d4, 0xd4c3b2a1, 0xa1b23c4d, 0x4d3cb2a1):
+                # ── PCAP 格式：增量读（上限即停，不整文件载入）──
+                yield from self._read_pcap_stream(f, magic, max_read_packets)
+            elif magic == 0x0a0d0d0a:
+                # ── PCAPNG 格式：按块增量读（上限即停，不整文件载入）──
+                # head 的8字节（首块头）已被读出，作为流前缀传回
+                yield from self._read_pcapng_stream(
+                    f, max_read_packets, prefix=head)
+            else:
+                raise ValueError(f"不支持的文件格式: magic=0x{magic:08x}")
+
+    def _read_pcap_stream(self, f, magic: int,
+                          max_read_packets: Optional[int] = None):
+        """PCAP 增量读取：按包头 incl_len 逐包读，达上限即停。"""
+        endian = '<' if magic in (0xa1b2c3d4, 0xa1b23c4d) else '>'
+        # 纳秒精度由文件头magic直接判定：0xa1b23c4d(小端)/0x4d3cb2a1(大端)
+        tsresol = 1_000_000_000.0 if magic in (0xa1b23c4d, 0x4d3cb2a1) else 1_000_000.0
+        gh = f.read(16)                 # 全局头剩余16字节（含link_type）
+        if len(gh) < 16:
             return
+        link_type = struct.unpack(f'{endian}I', gh[12:16])[0]
+        n = 0
+        while True:
+            ph = f.read(16)
+            if len(ph) < 16:
+                break
+            ts_sec, ts_frac, incl_len = struct.unpack(f'{endian}III', ph[:12])
+            pkt_data = f.read(incl_len)
+            if len(pkt_data) < incl_len:
+                break
+            n += 1
+            yield pkt_data, ts_sec + ts_frac / tsresol, link_type
+            if max_read_packets is not None and n >= max_read_packets:
+                break
 
-        magic = struct.unpack('<I', data[0:4])[0]
+    def _iter_pcapng_blocks(self, f, st: dict, prefix: bytes = b''):
+        """PCAPNG 增量逐块读取：yield 完整块字节（type+len+body+tail）。
 
-        if magic in (0xa1b2c3d4, 0xd4c3b2a1, 0xa1b23c4d, 0x4d3cb2a1):
-            # ── PCAP 格式 ──
-            endian = '<' if magic in (0xa1b2c3d4, 0xa1b23c4d) else '>'
-            # 纳秒精度由文件头magic直接判定：0xa1b23c4d(小端)/0x4d3cb2a1(大端)
-            tsresol = 1_000_000_000.0 if magic in (0xa1b23c4d, 0x4d3cb2a1) else 1_000_000.0
-            link_type = struct.unpack(f'{endian}I', data[20:24])[0]
-            pos = 24
-
-            while pos + 16 <= len(data):
-                ts_sec = struct.unpack(f'{endian}I', data[pos:pos+4])[0]
-                ts_frac = struct.unpack(f'{endian}I', data[pos+4:pos+8])[0]
-                incl_len = struct.unpack(f'{endian}I', data[pos+8:pos+12])[0]
-                pos += 16
-                if pos + incl_len > len(data):
-                    break
-                pkt_data = data[pos:pos+incl_len]
-                pos += incl_len
-                timestamp = ts_sec + ts_frac / tsresol
-                yield pkt_data, timestamp, link_type
-
-        elif magic == 0x0a0d0d0a:
-            # ── PCAPNG 格式 ──
-            yield from self._read_pcapng(data)
-
-        else:
-            raise ValueError(f"不支持的文件格式: magic=0x{magic:08x}")
-
-    def _read_pcapng(self, data: bytes):
-        """解析PCAPNG格式，yield (pkt_data, timestamp, link_type)
-        支持小端/大端section（由SHB的BOM判定）；BOM无效时报错而非静默读空。
+        st 为共享解码状态（endian/link_type/tsresol/ifaces），SHB 出现时
+        在此更新 endian——块长字段始终按其所属 section 的字节序解码。
+        prefix: 调用方已从 f 读出的首段字节（如 _read_packets 读出的
+        魔数头8字节），先于文件剩余内容参与组块。
+        BOM 无效时报错而非静默读空（与整读版一致）。
         """
-        pos = 0
-        endian = '<'  # 当前section字节序
-        link_type = 1  # 默认以太网
-        tsresol = 1_000_000.0  # 默认微秒
-        ifaces = []  # 接口描述列表 [{link_type, tsresol}]
-
-        while pos + 12 <= len(data):
-            # SHB块类型0x0a0d0d0a为回文，不受字节序影响；BOM在绝对偏移pos+8
-            if data[pos:pos+4] == b'\x0a\x0d\x0d\x0a':
-                bom = struct.unpack('<I', data[pos+8:pos+12])[0]
+        buf = prefix
+        while True:
+            while len(buf) < 8:
+                chunk = f.read(8192)
+                if not chunk:
+                    return
+                buf += chunk
+            hdr, buf = buf[:8], buf[8:]
+            if hdr[0:4] == b'\x0a\x0d\x0d\x0a':
+                # SHB：块类型回文不受字节序影响；BOM 在偏移8
+                while len(buf) < 4:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        return
+                    buf += chunk
+                bom_bytes, buf = buf[:4], buf[4:]
+                bom = struct.unpack('<I', bom_bytes)[0]
                 if bom == 0x1A2B3C4D:
-                    endian = '<'
+                    st['endian'] = '<'
                 elif bom == 0x4D3C2B1A:
-                    endian = '>'
+                    st['endian'] = '>'
                 else:
                     raise ValueError(f"PCAPNG字节序标记(BOM)无效: 0x{bom:08x}")
-            block_type = struct.unpack(f'{endian}I', data[pos:pos+4])[0]
-            block_len = struct.unpack(f'{endian}I', data[pos+4:pos+8])[0]
-            if block_len < 12 or pos + block_len > len(data):
-                break
+                endian = st['endian']
+                block_len = struct.unpack(f'{endian}I', hdr[4:8])[0]
+                if block_len < 12:
+                    return
+                need = block_len - 12
+                while len(buf) < need:
+                    chunk = f.read(max(8192, need - len(buf)))
+                    if not chunk:
+                        return
+                    buf += chunk
+                rest, buf = buf[:need], buf[need:]
+                yield hdr + bom_bytes + rest
+            else:
+                endian = st['endian']
+                block_len = struct.unpack(f'{endian}I', hdr[4:8])[0]
+                if block_len < 12:
+                    return
+                need = block_len - 8
+                while len(buf) < need:
+                    chunk = f.read(max(8192, need - len(buf)))
+                    if not chunk:
+                        return
+                    buf += chunk
+                rest, buf = buf[:need], buf[need:]
+                yield hdr + rest
 
-            body = data[pos+8:pos+block_len-4]
-            # 块尾部的Total Length（用于校验）
-            tail_len = struct.unpack(f'{endian}I', data[pos+block_len-4:pos+block_len])[0]
+    def _decode_pcapng_block(self, st: dict, raw: bytes):
+        """解码单个PCAPNG块 -> [(pkt_data, timestamp, link_type)]。
+
+        流式与整读共用本实现（单一解析逻辑）；st 状态跨块保持。
+        """
+        endian = st['endian']
+        block_type = struct.unpack(f'{endian}I', raw[0:4])[0]
+        block_len = struct.unpack(f'{endian}I', raw[4:8])[0]
+        body = raw[8:block_len-4]
+        out = []
+
+        if block_type == 0x0a0d0d0a:
+            # Section Header Block：endian 已在 _iter_pcapng_blocks 更新
+            pass
+        elif block_type == 0x00000001:
+            # Interface Description Block
+            if len(body) >= 8:
+                lt = struct.unpack(f'{endian}H', body[0:2])[0]
+                # Options中查找tsresol（optcode=9）
+                opt_tsresol = 1_000_000.0
+                opt_pos = 8
+                while opt_pos + 4 <= len(body):
+                    opt_code = struct.unpack(f'{endian}H', body[opt_pos:opt_pos+2])[0]
+                    opt_len = struct.unpack(f'{endian}H', body[opt_pos+2:opt_pos+4])[0]
+                    if opt_code == 0:  # opt_endofopt
+                        break
+                    if opt_code == 9 and opt_len >= 1:  # if_tsresol
+                        resol_byte = body[opt_pos+4]
+                        if resol_byte & 0x80:
+                            opt_tsresol = 2.0 ** (resol_byte & 0x7f)
+                        else:
+                            opt_tsresol = 10.0 ** resol_byte
+                    opt_pos += 4 + ((opt_len + 3) & ~3)  # 4字节对齐
+                st['ifaces'].append({'link_type': lt, 'tsresol': opt_tsresol})
+        elif block_type == 0x00000006:
+            # Enhanced Packet Block
+            if len(body) >= 20:
+                iface_id = struct.unpack(f'{endian}I', body[0:4])[0]
+                ts_high = struct.unpack(f'{endian}I', body[4:8])[0]
+                ts_low = struct.unpack(f'{endian}I', body[8:12])[0]
+                cap_len = struct.unpack(f'{endian}I', body[12:16])[0]
+                if iface_id < len(st['ifaces']):
+                    iface = st['ifaces'][iface_id]
+                    lt = iface['link_type']
+                    resol = iface['tsresol']
+                else:
+                    lt = st['link_type']
+                    resol = st['tsresol']
+                ts_raw = (ts_high << 32) | ts_low
+                timestamp = ts_raw / resol
+                pkt_offset = 20
+                if pkt_offset + cap_len <= len(body):
+                    pkt_data = body[pkt_offset:pkt_offset+cap_len]
+                    out.append((pkt_data, timestamp, lt))
+        elif block_type == 0x00000003:
+            # Simple Packet Block
+            if len(body) >= 4:
+                orig_len = struct.unpack(f'{endian}I', body[0:4])[0]
+                cap_len = min(orig_len, block_len - 16)  # 块头+尾共12字节+4字节orig_len
+                if 4 + cap_len <= len(body):
+                    pkt_data = body[4:4+cap_len]
+                    out.append((pkt_data, 0.0, st['link_type']))  # SPB无时间戳
+        return out
+
+    @staticmethod
+    def _new_pcapng_state() -> dict:
+        return {'endian': '<', 'link_type': 1, 'tsresol': 1_000_000.0,
+                'ifaces': []}
+
+    def _read_pcapng_stream(self, f, max_read_packets: Optional[int] = None,
+                            prefix: bytes = b''):
+        """PCAPNG 流式读取：按块增量解码，yield (pkt_data, ts, link_type)。
+
+        达到 max_read_packets 即停止读取（真读包上限，不是读完再截）。
+        块尾 Total Length 校验失败按文件截断处理（停止，与整读版一致）。
+        """
+        st = self._new_pcapng_state()
+        n = 0
+        for raw in self._iter_pcapng_blocks(f, st, prefix=prefix):
+            endian = st['endian']
+            block_len = struct.unpack(f'{endian}I', raw[4:8])[0]
+            tail_len = struct.unpack(f'{endian}I',
+                                     raw[block_len-4:block_len])[0]
             if tail_len != block_len:
                 break
+            for pkt_data, timestamp, link_type in self._decode_pcapng_block(st, raw):
+                yield pkt_data, timestamp, link_type
+                n += 1
+                if max_read_packets is not None and n >= max_read_packets:
+                    return
 
-            if block_type == 0x0a0d0d0a:
-                # Section Header Block：BOM已在循环头处理
-                pass
-            elif block_type == 0x00000001:
-                # Interface Description Block
-                if len(body) >= 8:
-                    lt = struct.unpack(f'{endian}H', body[0:2])[0]
-                    # Options中查找tsresol（optcode=9）
-                    opt_tsresol = 1_000_000.0
-                    opt_pos = 8
-                    while opt_pos + 4 <= len(body):
-                        opt_code = struct.unpack(f'{endian}H', body[opt_pos:opt_pos+2])[0]
-                        opt_len = struct.unpack(f'{endian}H', body[opt_pos+2:opt_pos+4])[0]
-                        if opt_code == 0:  # opt_endofopt
-                            break
-                        if opt_code == 9 and opt_len >= 1:  # if_tsresol
-                            resol_byte = body[opt_pos+4]
-                            if resol_byte & 0x80:
-                                opt_tsresol = 2.0 ** (resol_byte & 0x7f)
-                            else:
-                                opt_tsresol = 10.0 ** resol_byte
-                        opt_pos += 4 + ((opt_len + 3) & ~3)  # 4字节对齐
-                    ifaces.append({'link_type': lt, 'tsresol': opt_tsresol})
-            elif block_type == 0x00000006:
-                # Enhanced Packet Block
-                if len(body) >= 20:
-                    iface_id = struct.unpack(f'{endian}I', body[0:4])[0]
-                    ts_high = struct.unpack(f'{endian}I', body[4:8])[0]
-                    ts_low = struct.unpack(f'{endian}I', body[8:12])[0]
-                    cap_len = struct.unpack(f'{endian}I', body[12:16])[0]
-                    if iface_id < len(ifaces):
-                        iface = ifaces[iface_id]
-                        lt = iface['link_type']
-                        resol = iface['tsresol']
-                    else:
-                        lt = link_type
-                        resol = tsresol
-                    ts_raw = (ts_high << 32) | ts_low
-                    timestamp = ts_raw / resol
-                    pkt_offset = 20
-                    if pkt_offset + cap_len <= len(body):
-                        pkt_data = body[pkt_offset:pkt_offset+cap_len]
-                        yield pkt_data, timestamp, lt
-            elif block_type == 0x00000003:
-                # Simple Packet Block
-                if len(body) >= 4:
-                    orig_len = struct.unpack(f'{endian}I', body[0:4])[0]
-                    cap_len = min(orig_len, block_len - 16)  # 块头+尾共12字节+4字节orig_len
-                    if 4 + cap_len <= len(body):
-                        pkt_data = body[4:4+cap_len]
-                        yield pkt_data, 0.0, link_type  # SPB无时间戳
-            pos += block_len
+    def _read_pcapng(self, data: bytes):
+        """解析PCAPNG格式（整段字节），yield (pkt_data, timestamp, link_type)。
+
+        兼容保留（旧调用方/测试）；内部走与流式相同的块解码器。
+        """
+        import io
+        yield from self._read_pcapng_stream(io.BytesIO(data),
+                                            max_read_packets=None)
 
     def _tls_feed(self, pkt):
         """按四元组方向缓冲TCP载荷，凑满完整TLS握手record后解析（支持跨分段ClientHello）"""
@@ -207,24 +297,16 @@ class PCAPReader:
                 self._tls_buffers.pop(k2, None)
                 self.tls_buffer_evicted += 1
 
-    def read_pcap(self, file_path: str) -> List[FlowSession]:
-        """读取PCAP/PCAPNG文件，返回所有会话"""
-        self.session_manager.reset()
-        self._tls_buffers = {}
+    def read_pcap(self, file_path: str,
+                  max_read_packets: Optional[int] = None) -> List[FlowSession]:
+        """读取PCAP/PCAPNG文件，返回所有会话。
 
-        for pkt_data, timestamp, link_type in self._read_packets(file_path):
-            try:
-                self._process_raw_packet(pkt_data, timestamp, link_type)
-            except Exception:
-                self.parse_errors += 1
-            self.total_packets += 1
-
-        # 关闭所有剩余会话并累加TCP异常统计
-        closed_sessions = self.session_manager.flush_all()
-        for session in closed_sessions:
-            self._accumulate_tcp_anomalies(session)
-
-        return self.session_manager.get_all_closed_sessions()
+        max_read_packets: 真正的读包上限（读满即停，不是读完再截）。
+        实现为 list(read_pcap_generator(...))——整批与流式同一读取路径，
+        会话顺序/统计字段按构造一致（2026-09-18 第二轮）。
+        """
+        return list(self.read_pcap_generator(
+            file_path, max_read_packets=max_read_packets))
 
     def _accumulate_tcp_anomalies(self, session: FlowSession):
         """从会话中累加重传/乱序统计"""
@@ -235,19 +317,43 @@ class PCAPReader:
             self.total_out_of_order += session.num_out_of_order
             self.sessions_with_out_of_order += 1
 
-    def read_pcap_generator(self, file_path: str) -> Generator[FlowSession, None, None]:
-        """生成器方式读取PCAP/PCAPNG，边解析边产出已完成会话"""
+    def read_pcap_generator(self, file_path: str,
+                            max_read_packets: Optional[int] = None
+                            ) -> Generator[FlowSession, None, None]:
+        """生成器方式读取PCAP/PCAPNG，边解析边产出已完成会话（有界内存）。
+
+        正式提取入口（runtime）消费本生成器：会话经 take_closed_sessions
+        即取即弃，已关闭会话不囤积；max_read_packets 为真读包上限
+        （读满即停止读取，不因资源上限静默丢已读会话）。
+        逐包异常计入 parse_errors（与整批 read_pcap 同口径）；
+        read_capped / packets_last_read 读后可查。
+        """
         self.session_manager.reset()
         self._tls_buffers = {}
+        self.read_capped = False
+        self.packets_last_read = 0
+        self.first_timestamp = None
+        n_read = 0
 
-        for pkt_data, timestamp, link_type in self._read_packets(file_path):
-            self._process_raw_packet(pkt_data, timestamp, link_type)
-            # M4: 全部关闭路径（返回值/FIN/超时/驱逐）统一从 closed 交付，
+        for pkt_data, timestamp, link_type in self._read_packets(
+                file_path, max_read_packets=max_read_packets):
+            if self.first_timestamp is None:
+                self.first_timestamp = float(timestamp)
+            try:
+                self._process_raw_packet(pkt_data, timestamp, link_type)
+            except Exception:
+                self.parse_errors += 1
+            self.total_packets += 1
+            n_read += 1
+            # M4: 全部关闭路径（返回值/FIN/RST/超时/驱逐）统一从 closed 交付，
             # 交付即释放（SM 不囤积、不重复交付）
             for s in self.session_manager.take_closed_sessions():
                 self._accumulate_tcp_anomalies(s)
                 yield s
-            self.total_packets += 1
+
+        self.read_capped = (max_read_packets is not None
+                            and n_read >= max_read_packets)
+        self.packets_last_read = n_read
 
         # 产出所有剩余会话并累加统计
         for session in self.session_manager.flush_all():
@@ -368,6 +474,8 @@ class PCAPReader:
         """获取解析统计信息"""
         return {
             'total_packets': self.total_packets,
+            'packets_last_read': self.packets_last_read,
+            'read_capped': self.read_capped,
             'total_tcp_packets': self.total_tcp_packets,
             'total_udp_packets': self.total_udp_packets,
             'total_tls_records': self.total_tls_records,

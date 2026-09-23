@@ -19,6 +19,19 @@ from src.parser.session.session_manager import FlowSession, PacketInfo, Protocol
 class BasicFeatureExtractor:
     """基础特征提取器"""
 
+    # 族名 -> 方法名（requested_features 按需计算的最小算子单位；
+    # 与 extract_all 完全同一批方法，特征公式无第二份实现）
+    FAMILY_METHODS = {
+        'session_info': '_extract_session_info',
+        'protocol': '_extract_protocol_features',
+        'flow_stats': '_extract_flow_stats',
+        'timing': '_extract_timing_features',
+        'flags': '_extract_flag_features',
+        'structure': '_extract_structure_features',
+        'behavior': '_extract_behavior_features',
+    }
+    _FEATURE_FAMILY_INDEX: Optional[Dict[str, str]] = None
+
     def extract_all(self, session: FlowSession) -> Dict[str, float]:
         """提取全部基础特征"""
         features = {}
@@ -45,6 +58,65 @@ class BasicFeatureExtractor:
         features.update(self._extract_behavior_features(session))
 
         return features
+
+    @classmethod
+    def _feature_family_index(cls) -> Dict[str, str]:
+        """特征名 -> 族名（合成会话上各族实际产出动态推导，进程内缓存）。
+
+        防硬编码漂移：新增/改名特征自动归族，与 operators 的族索引同思路。
+        """
+        if cls._FEATURE_FAMILY_INDEX is None:
+            from src.parser.session.session_manager import (
+                FlowSession as _FS, PacketInfo as _PI, Protocol as _Proto)
+            s = _FS(src_ip="10.0.0.2", dst_ip="10.0.0.1", src_port=5000,
+                    dst_port=443, protocol=_Proto.TCP,
+                    start_time=0.0, end_time=0.8)
+            seq = 1000
+            for i in range(8):
+                p = _PI(timestamp=i * 0.1, src_ip="10.0.0.2",
+                        dst_ip="10.0.0.1", src_port=5000, dst_port=443,
+                        protocol=_Proto.TCP, length=100 + i * 50,
+                        payload_length=50 + i * 40, tcp_flags=0x18,
+                        tcp_seq=seq, payload=b"\x41" * (50 + i * 40),
+                        direction=1 if i % 2 == 0 else -1)
+                seq += 50 + i * 40
+                s.packets.append(p)
+                if p.direction == 1:
+                    s.total_fwd_packets += 1
+                    s.total_fwd_bytes += p.length
+                else:
+                    s.total_bwd_packets += 1
+                    s.total_bwd_bytes += p.length
+            ext = cls()
+            idx: Dict[str, str] = {}
+            for fam, method in cls.FAMILY_METHODS.items():
+                try:
+                    names = getattr(ext, method)(s).keys()
+                except Exception:  # noqa: BLE001
+                    continue
+                for n in names:
+                    idx.setdefault(n, fam)
+            cls._FEATURE_FAMILY_INDEX = idx
+        return cls._FEATURE_FAMILY_INDEX
+
+    def extract(self, requested, session: FlowSession) -> Dict[str, float]:
+        """按名提取：只调用覆盖所需特征的族方法，只返回请求的名字。
+
+        fast profile 的实现核心（2026-09-18 第三轮）：
+        - 不"先算全部再切列"——未请求的族方法一次都不调用；
+        - 公式单一来源：族方法与 extract_all 同一批，逐值一致（有回归钉死）；
+        - 请求了不存在的名字：不产出该键（调用方按缺失语义处理，不伪造0）。
+        """
+        if requested is None:
+            return self.extract_all(session)
+        want = list(dict.fromkeys(requested))     # 去重保序
+        idx = self._feature_family_index()
+        need_families = {idx[n] for n in want if n in idx}
+        computed: Dict[str, float] = {}
+        for fam, method in self.FAMILY_METHODS.items():
+            if fam in need_families:
+                computed.update(getattr(self, method)(session))
+        return {n: computed[n] for n in want if n in computed}
 
     # ==================== 会话基本信息 ====================
 

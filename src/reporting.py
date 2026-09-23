@@ -24,13 +24,23 @@ from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------- mine 层
 def compute_feature_effectiveness(df, y, selected: List[str],
-                                  engine_supported: Optional[set] = None
+                                  engine_supported: Optional[set] = None,
+                                  parity_features: Optional[set] = None,
+                                  evidence_split: str = "unspecified"
                                   ) -> Dict:
     """特征有效性原始表（可审查，不自称官方验收口径）。
 
     返回 {"A": [...], "E": [...], "pending": [...], "rows": {...}}；
     rows[feat] = {"computable", "consistent", "discriminative",
                   "engine_supported", "effective", "reason"}。
+
+    证据语义（审计 2026-09-18，不再默认通过）：
+    - consistent：仅当调用方提供 parity_features（训练/推理实测同源特征名
+      集合）且该特征在其中；缺证据 -> None + pending。
+    - engine_supported：仅当调用方提供引擎支持集且该特征在其中；
+      缺证据 -> False + pending。
+    - discriminative：ANOVA 在调用方传入的 df 上计算；evidence_split
+      标注证据来源（validation / train），不冒充验证集。
     """
     from scipy.stats import f_oneway
     all_feats = [c for c in df.columns if not str(c).startswith("_")]
@@ -43,7 +53,12 @@ def compute_feature_effectiveness(df, y, selected: List[str],
     for feat in a_set:
         col = df[feat]
         computable = bool(col.notna().any()) and col.astype(float).nunique() > 1
-        consistent = True   # 单一 runtime 入口保证定义一致（P0 parity 证据）
+        if parity_features is None:
+            consistent = None
+            consistent_reason = "无parity证据；pending"
+        else:
+            consistent = feat in parity_features
+            consistent_reason = "" if consistent else "训练/推理schema外；pending"
         disc = False
         reason = ""
         if computable and len(groups_idx) >= 2:
@@ -54,7 +69,7 @@ def compute_feature_effectiveness(df, y, selected: List[str],
                 try:
                     _, p = f_oneway(*groups)
                     disc = p < 0.05
-                    reason = f"ANOVA p={p:.4g}"
+                    reason = f"ANOVA p={p:.4g}（证据集: {evidence_split}）"
                 except Exception as e:  # noqa: BLE001
                     disc = False
                     reason = f"ANOVA异常({e})；pending"
@@ -62,10 +77,16 @@ def compute_feature_effectiveness(df, y, selected: List[str],
                 reason = "类别组不足；pending"
         elif not computable:
             reason = "全缺失或常数"
-        engine_ok = (engine_supported is None) or (feat in engine_supported)
-        if not engine_ok:
-            reason += "；引擎不支持"
-        effective = computable and consistent and disc and engine_ok
+        engine_ok = (engine_supported is not None) and (feat in engine_supported)
+        if engine_supported is None:
+            reason += "；无引擎支持证据；pending"
+        elif not engine_ok:
+            reason += "；引擎不支持（未入bundle规则可达集）"
+        if consistent is None:
+            reason += f"；{consistent_reason}"
+        elif not consistent:
+            reason += f"；{consistent_reason}"
+        effective = (computable and consistent is True and disc and engine_ok)
         if "pending" in reason:
             pending.append(feat)
         elif effective:
@@ -78,16 +99,23 @@ def compute_feature_effectiveness(df, y, selected: List[str],
         }
     return {"A": a_set, "E": e_list, "pending": pending, "rows": rows,
             "effective_rate": len(e_list) / len(a_set) if a_set else 0.0,
+            "evidence_split": evidence_split,
             "definition": "EffectiveRate=|E|/|A|；五级判定见模块docstring；"
                           "selected/all 为保留比例，非有效率"}
 
 
 def build_mine_layer(df, y, selected, rules, label_names, output_dir: str,
-                     confidence_threshold: float = 0.7) -> Dict:
+                     confidence_threshold: float = 0.7,
+                     parity_features: Optional[set] = None,
+                     engine_supported: Optional[set] = None,
+                     evidence_split: str = "unspecified") -> Dict:
     """mine 层三件：catalog / effectiveness / class_profiles。"""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    eff = compute_feature_effectiveness(df, y, selected)
+    eff = compute_feature_effectiveness(df, y, selected,
+                                        engine_supported=engine_supported,
+                                        parity_features=parity_features,
+                                        evidence_split=evidence_split)
     # feature_catalog.json
     catalog = []
     for feat in eff["A"]:
@@ -119,10 +147,11 @@ def build_mine_layer(df, y, selected, rules, label_names, output_dir: str,
             w.writerow([feat, r["computable"], r["consistent"],
                         r["discriminative"], r["engine_supported"],
                         r["effective"], r["selected"], r["reason"]])
-    # class_profiles.json
+    # class_profiles.json（label_names 为 {类别ID: 名称}，直接按 ID 取名；
+    # 旧版曾把词表倒置再用 ID 查名称，导致 profile 键退化为 "0"/"1"）
     profiles = {}
     yv = list(y)
-    names = {v: k for k, v in (label_names or {}).items()}
+    names = {int(k): v for k, v in (label_names or {}).items()}
     for lid in sorted(set(yv)):
         sub = df[y == lid]
         prof = {"support": int((y == lid).sum())}
@@ -130,7 +159,7 @@ def build_mine_layer(df, y, selected, rules, label_names, output_dir: str,
             col = sub[feat]
             prof[feat] = {"mean": float(col.mean()) if len(col) else None,
                           "std": float(col.std()) if len(col) > 1 else 0.0}
-        profiles[names.get(lid, str(lid))] = prof
+        profiles[names.get(int(lid), str(lid))] = prof
     (out / "class_profiles.json").write_text(
         json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
     return eff
@@ -148,8 +177,8 @@ def build_evaluate_layer(bundle_dir: str, predictions_path: str,
     rules = json.loads((b / "rules.json").read_text(encoding="utf-8"))
     selected = json.loads((b / "selected_features.json").read_text(
         encoding="utf-8"))
-    preds = json.loads(Path(predictions_path).read_text(encoding="utf-8"))
-    results = preds.get("results", preds if isinstance(preds, list) else [])
+    from src.evaluation import load_predictions
+    results = load_predictions(predictions_path)
     # 混淆
     conf = {}
     for p in results:
@@ -159,21 +188,29 @@ def build_evaluate_layer(bundle_dir: str, predictions_path: str,
         conf[tl][p.get("predicted_label", "?")] += 1
     (out / "confusion_analysis.json").write_text(
         json.dumps(conf, ensure_ascii=False, indent=2), encoding="utf-8")
-    # 误判样例
+    # 误判样例（漏检=预测unknown也如实列出；未配对单列；不再用
+    # "排除unknown"掩盖漏检——审计 2026-09-18）
     with open(out / "misclassified_samples.jsonl", "w",
               encoding="utf-8") as f:
         for p in results:
             t = truth.get(Path(p.get("source_file", "")).name, {})
             tl = t.get("label", "?")
             pl = p.get("predicted_label", "?")
-            if tl != pl and not (tl == "?" or pl == "unknown"):
-                f.write(json.dumps({
-                    "observation_id": p.get("observation_id"),
-                    "source_file": p.get("source_file"),
-                    "window": [p.get("window_start"), p.get("window_end")],
-                    "true": tl, "pred": pl,
-                    "confidence": p.get("confidence")}, ensure_ascii=False)
-                    + "\n")
+            if tl == "?":
+                kind = "unpaired_truth"
+            elif tl == pl:
+                continue
+            elif pl in (None, "", "unknown"):
+                kind = "miss_unknown"
+            else:
+                kind = "confusion"
+            f.write(json.dumps({
+                "observation_id": p.get("observation_id"),
+                "source_file": p.get("source_file"),
+                "window": [p.get("window_start"), p.get("window_end")],
+                "true": tl, "pred": pl, "kind": kind,
+                "confidence": p.get("confidence")}, ensure_ascii=False)
+                + "\n")
     # rules_explained
     expl = []
     for r in rules:

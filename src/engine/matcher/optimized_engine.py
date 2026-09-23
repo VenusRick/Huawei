@@ -79,7 +79,9 @@ class OptimizedDPIEngine:
         rules, features, label_names, config = load_rule_bundle(bundle_dir)
         self.rules = rules
         self.selected_features = features
-        self.label_names = label_names
+        # bundle_config.json 的 key 是字符串（JSON 限制）；数值 key 归一回 int
+        self.label_names = {int(k) if str(k).lstrip('-').isdigit() else k: v
+                            for k, v in label_names.items()}
         self.confidence_threshold = config.get('confidence_threshold', 0.65)
         self.classifier = None  # 规则模式：禁用预测器，仅严格规则匹配
         print(f"[DPI Engine] 从 {bundle_dir} 加载规则包: {len(rules)} 条规则, "
@@ -112,8 +114,13 @@ class OptimizedDPIEngine:
 
         优先级：
         1. XGBoost集成分类器（如果有）
-        2. 决策树规则
-        3. 统计规则
+        2. 规则（按 priority 升序评估——数值小者先评估先命中；
+           decision_tree=100 先于 statistical=200，2026-09-18 第二轮
+           将原本无人消费的 priority 字段定为确定性执行顺序，
+           不再隐式依赖 rules 列表顺序）
+        规则命中且置信度 >= confidence_threshold 才返回（阈值对规则
+        路径同样生效；低于阈值的命中按未匹配处理，2026-09-18 第二轮：
+        旧实现 conf=0.0 的零覆盖统计规则也照发预测）。
         """
         start_time = time.perf_counter()
         results = []
@@ -144,18 +151,23 @@ class OptimizedDPIEngine:
                     match_time_ms=elapsed_ms,
                 ))
 
-        # 方式2：决策树规则 + 统计规则（备选）
+        # 方式2：决策树规则 + 统计规则（备选，按 priority 升序）
         if not results:
-            for rule in self.rules:
+            ordered = sorted(
+                enumerate(self.rules),
+                key=lambda t: (t[1].get('priority', float('inf')), t[0]))
+            for _idx, rule in ordered:
                 if rule.get('type') == 'ensemble_classifier':
                     continue
                 if rule.get('type') in ('decision_tree', 'statistical'):
                     match_result = self._evaluate_rule(rule, features)
-                    if match_result:
+                    if match_result and (
+                            match_result.confidence
+                            >= self.confidence_threshold):
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
                         match_result.match_time_ms = elapsed_ms
                         results.append(match_result)
-                        break  # 取第一个匹配的规则
+                        break  # 取第一条命中且过阈值的规则
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         self.total_matches += len(results)
@@ -192,12 +204,24 @@ class OptimizedDPIEngine:
                 elif op == '<=':
                     if float(feat_val) <= float(cond['value']):
                         matched += 1
+                elif op == '>=':
+                    if float(feat_val) >= float(cond['value']):
+                        matched += 1
                 elif op == '>':
                     if float(feat_val) > float(cond['value']):
+                        matched += 1
+                elif op == '<':
+                    if float(feat_val) < float(cond['value']):
+                        matched += 1
+                elif op == '!=':
+                    if float(feat_val) != float(cond['value']):
                         matched += 1
                 elif op == '==':
                     if str(feat_val) == str(cond['value']):
                         matched += 1
+                elif op == 'exists':
+                    # 特征存在且非缺失（前置 None 分支已保证存在）
+                    matched += 1
                 elif op == 'contains':
                     if isinstance(cond['value'], list):
                         if any(v in str(feat_val) for v in cond['value']):
@@ -208,6 +232,9 @@ class OptimizedDPIEngine:
                     # R19: 0是合法观测值不算缺失；缺失已在前置分支处理
                     if feat_val == '':
                         matched += 1
+                else:
+                    # 未知运算符：显式判不匹配（不静默跳过该条件）
+                    return None
             except (ValueError, TypeError):
                 pass
 

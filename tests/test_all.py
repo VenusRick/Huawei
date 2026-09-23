@@ -83,23 +83,22 @@ def test_tls_parser():
 
     record = parser.parse_record(bytes(tls_record))
 
-    if record and record.client_hello:
-        ch = record.client_hello
-        print(f"  ✓ TLS版本: 0x{ch.tls_version:04x}")
-        print(f"  ✓ SNI: {ch.sni}")
-        print(f"  ✓ 密码套件数: {len(ch.cipher_suites)}")
-        print(f"  ✓ 扩展数: {len(ch.extensions)}")
-        print(f"  ✓ 支持版本: {[hex(v) for v in ch.supported_versions]}")
-        print(f"  ✓ JA3哈希: {ch.ja3_hash}")
-        print(f"  ✓ JA4哈希: {ch.ja4_hash[:16]}...")
-        features = parser.extract_features(record)
-        print(f"  ✓ 提取特征数: {len(features)}")
-    else:
-        print("  ✗ TLS解析失败")
-        return False
+    assert record is not None and record.client_hello, "TLS ClientHello 解析失败"
+    ch = record.client_hello
+    print(f"  ✓ TLS版本: 0x{ch.tls_version:04x}")
+    print(f"  ✓ SNI: {ch.sni}")
+    print(f"  ✓ 密码套件数: {len(ch.cipher_suites)}")
+    print(f"  ✓ 扩展数: {len(ch.extensions)}")
+    print(f"  ✓ 支持版本: {[hex(v) for v in ch.supported_versions]}")
+    print(f"  ✓ JA3哈希: {ch.ja3_hash}")
+    print(f"  ✓ JA4哈希: {ch.ja4_hash[:16]}...")
+    features = parser.extract_features(record)
+    print(f"  ✓ 提取特征数: {len(features)}")
+    assert ch.sni == 'www.google.com', f"SNI 不符: {ch.sni}"
+    assert len(ch.cipher_suites) == 2
+    assert len(features) > 0, "TLS 特征提取为空"
 
     print()
-    return True
 
 
 def test_session_manager():
@@ -159,15 +158,22 @@ def test_session_manager():
     sessions = sm.flush_all()
     print(f"  ✓ 关闭后会话数: {len(sessions)}")
 
-    if sessions:
-        s = sessions[0]
-        print(f"  ✓ 首个会话: {s.src_ip}:{s.src_port} → {s.dst_ip}:{s.dst_port}")
-        print(f"    持续时间: {s.duration:.3f}s")
-        print(f"    总包数: {s.total_packets}")
-        print(f"    前向/后向: {s.total_fwd_packets}/{s.total_bwd_packets}")
+    assert len(sessions) == 1, f"三次握手+数据应归并为1个会话, 实得 {len(sessions)}"
+    s = sessions[0]
+    print(f"  ✓ 首个会话: {s.src_ip}:{s.src_port} → {s.dst_ip}:{s.dst_port}")
+    print(f"    持续时间: {s.duration:.3f}s")
+    print(f"    总包数: {s.total_packets}")
+    print(f"    前向/后向: {s.total_fwd_packets}/{s.total_bwd_packets}")
+    assert s.src_ip == '192.168.1.1' and s.dst_ip == '10.0.0.1'
+    # 合成数据的反向seq不连续，个别数据包按状态机计为重传被丢弃；
+    # 不变量：计入会话的包数 = 输入13 - 重传数，且方向计数守恒。
+    assert s.total_packets == 13 - s.num_retransmissions, \
+        f"total_packets {s.total_packets} != 13 - retrans {s.num_retransmissions}"
+    assert s.total_fwd_packets + s.total_bwd_packets == s.total_packets
+    assert abs(s.duration - 1.1) < 1e-6, f"duration 应为1.1s, 实得 {s.duration}"
+    assert len(s.packets) == s.total_packets
 
     print()
-    return True
 
 
 def test_feature_extraction():
@@ -225,8 +231,15 @@ def test_feature_extraction():
     all_feats = {**basic_feats, **advanced_feats}
     print(f"  ✓ 总特征数: {len(all_feats)}")
 
+    assert len(basic_feats) > 0 and len(advanced_feats) > 0, "特征提取为空"
+    assert len(all_feats) == len(basic_feats) + len(advanced_feats), \
+        "基础/高级特征键冲突"
+    for key in ['duration', 'total_packets', 'total_bytes',
+                'fwd_bwd_byte_ratio', 'iat_mean', 'pkt_size_mean']:
+        assert key in basic_feats, f"缺少基础特征 {key}"
+        assert np.isfinite(basic_feats[key]), f"{key} 非有限值"
+
     print()
-    return True
 
 
 def test_feature_selection():
@@ -259,8 +272,14 @@ def test_feature_selection():
     for feat, imp in report['importance_ranking'][:3]:
         print(f"    {feat}: {imp:.4f}")
 
+    assert len(selector.selected_features_) > 0, "特征选择结果为空"
+    assert 0 < report['num_selected'] <= 10
+    assert set(report['selected_features']) == set(selector.selected_features_)
+    # 与标签强关联的 feature_0/1/2 应至少有一个入选
+    assert {'feature_0', 'feature_1', 'feature_2'} & set(
+        selector.selected_features_), "强关联特征未入选"
+
     print()
-    return True
 
 
 def test_dpi_engine():
@@ -302,6 +321,7 @@ def test_dpi_engine():
     engine.load_rules(tmp_path)
     os.unlink(tmp_path)
     print(f"  ✓ 加载规则数: {len(engine.rules)}")
+    assert len(engine.rules) == 1
 
     # 测试匹配
     test_features = {
@@ -311,14 +331,19 @@ def test_dpi_engine():
     }
     matches = engine.match(test_features)
     print(f"  ✓ 匹配结果: {len(matches)} 条")
-    if matches:
-        print(f"    最佳: {matches[0].result} (置信度: {matches[0].confidence})")
+    assert matches, "满足全部条件的会话未命中规则"
+    print(f"    最佳: {matches[0].result} (置信度: {matches[0].confidence})")
+    assert matches[0].result == 'TestApp'
+    assert matches[0].confidence >= 0.65
+
+    # 反例：越界不命中（严格AND）
+    bad = engine.match({'total_bytes': 999999, 'duration': 10.0})
+    assert not bad, "越界特征不应命中"
 
     stats = engine.get_statistics()
     print(f"  ✓ 引擎统计: 平均匹配时间 {stats['avg_match_time_ms']:.4f} ms")
 
     print()
-    return True
 
 
 def test_end_to_end():
@@ -329,10 +354,15 @@ def test_end_to_end():
 
     pipeline = FeatureMiningPipeline()
 
-    # 测试挖掘模式（无PCAP，使用演示数据）
+    # 测试挖掘模式（无PCAP，使用演示数据）。
+    # 输出隔离：不再写 output/results（那是历史正式产物目录），
+    # 固定写审计测试目录，可用环境变量 TEST_ALL_OUTPUT 覆盖。
+    out_dir = os.environ.get(
+        'TEST_ALL_OUTPUT',
+        'output/chain_audit_20260918/test_all_out')
     result = pipeline.mine(
         pcap_dir='data/pcaps',
-        output_dir='output/results',
+        output_dir=out_dir,
         allow_demo=True  # 显式演示模式（R25后demo不再隐式触发）
     )
     print(f"  ✓ 挖掘结果:")
@@ -340,6 +370,8 @@ def test_end_to_end():
     print(f"    规则文件: {result['rule_file']}")
     if 'note' in result:
         print(f"    备注: {result['note']}")
+    assert result['total_rules'] > 0, "演示规则生成失败"
+    assert os.path.exists(result['rule_file']), "规则文件未落盘"
 
     # 测试检测模式
     if result['total_rules'] > 0:
@@ -347,7 +379,6 @@ def test_end_to_end():
         print(f"  ✓ 引擎已就绪")
 
     print()
-    return True
 
 
 def main():
@@ -366,11 +397,13 @@ def main():
 
     results = []
     for name, test_func in tests:
+        # 通过标准 = 断言全部成立正常返回（函数不再返回布尔值，
+        # 断言失败抛异常计为失败——pytest 与脚本入口同一口径）
         try:
             start = time.time()
-            success = test_func()
+            test_func()
             elapsed = time.time() - start
-            results.append((name, success, elapsed))
+            results.append((name, True, elapsed))
         except Exception as e:
             print(f"  ✗ 错误: {e}")
             import traceback

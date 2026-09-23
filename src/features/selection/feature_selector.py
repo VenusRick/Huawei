@@ -62,8 +62,14 @@ class FeatureSelector:
         mi_scores = self._compute_mi_scores(X_filtered, y, kept_names)
 
         # 归一化后加权融合: 0.6 * XGBoost + 0.4 * MI
-        importances = self._fuse_importances(xgb_importances, mi_scores, kept_names,
-                                              xgb_weight=0.6, mi_weight=0.4)
+        # （kept_names 为空=基础过滤全灭，极小样本防御：跳过融合直接空选）
+        if kept_names:
+            importances = self._fuse_importances(xgb_importances, mi_scores, kept_names,
+                                                 xgb_weight=0.6, mi_weight=0.4)
+        else:
+            importances = {}
+            print("  警告：基础过滤后无候选特征（样本过少或全常数），"
+                  "特征选择结果为空")
         self.feature_importances_ = importances
         self.xgb_importances_ = xgb_importances
         self.mi_scores_ = mi_scores

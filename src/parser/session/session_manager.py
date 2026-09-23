@@ -419,6 +419,14 @@ class SessionManager:
         is_fwd = (pkt.src_ip == session.src_ip and pkt.src_port == session.src_port)
         pkt.direction = 1 if is_fwd else -1
 
+        # 因果快照（审计 2026-09-18 第二轮）：记录"本包入列时刻"的
+        # 重传/乱序累计值，供前缀截断视图按截断点重放（不用未来事件）。
+        # 语义：截断到任一位置，计数=该位置最后入列包的快照值——重传/
+        # 乱序事件的观测(ingest)先于该包入列则计入；乱序包本体若因等待
+        # 重排落在列表后段，其"到达事件"仍按到达时刻因果计入。
+        pkt.cum_retransmissions = session.num_retransmissions
+        pkt.cum_out_of_order = session.num_out_of_order
+
         session.packets.append(pkt)
         session.end_time = pkt.timestamp
         session.last_activity_time = pkt.timestamp

@@ -20,33 +20,65 @@ class OptimizedRuleGenerator:
 
     def __init__(self, confidence_threshold: float = 0.70,
                  min_support: float = 0.1,
-                 min_confidence: float = 0.4):
+                 min_confidence: float = 0.4,
+                 tree_max_depth: Optional[int] = None,
+                 tree_min_samples_leaf: Optional[int] = None,
+                 tree_class_weight: Optional[str] = None):
         self.confidence_threshold = confidence_threshold
         self.min_support = min_support
         self.min_confidence = min_confidence
+        # 浅树参数：None = 按样本量/类数自适应（小样本放宽叶子下限，
+        # 防止 6类×41样本 因 min_samples_leaf=5 无法为小类产出纯叶规则）
+        self.tree_max_depth = tree_max_depth
+        self.tree_min_samples_leaf = tree_min_samples_leaf
+        # 类均衡浅树（2026-09-18 第三轮）：'balanced' 时 sklearn 以类权重
+        # 拟合分裂；导出规则的 confidence 一律用"未加权训练回放的真实
+        # precision"，加权纯度只作 leaf_purity 元数据，不冒充 precision
+        self.tree_class_weight = tree_class_weight
         self.rules: List[Dict] = []
         self.feature_definitions: Dict[str, Dict] = {}
         self.classifier = None
         self.label_names: Dict[int, str] = {}
 
+    def _adaptive_tree_params(self, n_samples: int, n_classes: int) -> Tuple[int, int]:
+        """自适应浅树参数（2026-09-18 第二轮；固定 depth5/leaf5 在小样本
+        多类下欠拟合：41样本6类只导出1条树规则）。
+
+        leaf = max(1, min(5, n // (2k)))——每类期望样本的一半为叶下限；
+        depth 默认 5，仅当 leaf 放宽后仍不足以给每类一个纯叶时加深。
+        显式构造参数优先（受控实验用；fit 只用 train）。
+        """
+        k = max(1, n_classes)
+        auto_leaf = max(1, min(5, n_samples // (2 * k)))
+        leaf = (self.tree_min_samples_leaf if self.tree_min_samples_leaf
+                is not None else auto_leaf)
+        depth = (self.tree_max_depth if self.tree_max_depth is not None
+                 else 5)
+        return int(depth), int(leaf)
+
     def fit_and_generate(self, X: pd.DataFrame, y: pd.Series,
                          selected_features: List[str],
-                         label_names: Dict[int, str]) -> List[Dict]:
+                         label_names: Dict[int, str],
+                         validation: Optional[Tuple[pd.DataFrame, pd.Series]] = None,
+                         groups: Optional[pd.Series] = None) -> List[Dict]:
         """
         训练集成分类器并生成规则
 
         Args:
-            X: 特征矩阵
-            y: 标签
+            X: 特征矩阵（仅训练集）
+            y: 标签（仅训练集）
             selected_features: 选中的特征列表
             label_names: 标签名映射
+            validation: 可选 (X_val, y_val)——显式验证集，只用于一次性离线
+                对照评估，不参与拟合（防泄漏；替代旧的5折CV）
+            groups: 训练样本的采集组（capture_id）；无验证集且组数>=2时
+                按组做 GroupKFold 对照，组数不足则明确跳过CV
 
         Returns:
             规则列表
         """
         from xgboost import XGBClassifier
         from sklearn.tree import DecisionTreeClassifier
-        from sklearn.model_selection import cross_val_score
 
         self.label_names = label_names
         X_sel = X[selected_features].fillna(0)
@@ -68,9 +100,47 @@ class OptimizedRuleGenerator:
         )
         self.classifier.fit(X_sel, y)
 
-        # 交叉验证评估
-        cv_scores = cross_val_score(self.classifier, X_sel, y, cv=5, scoring='f1_macro')
-        print(f"  [规则生成] XGBoost 5折CV Macro-F1: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+        # 离线对照评估（XGBoost 成绩只作特征/配置对照，不是规则DPI成绩）：
+        # - 有显式验证集 -> 验证集一次评估（不参与拟合）
+        # - 无验证集但采集组>=2 -> GroupKFold（同采集组不跨折）
+        # - 组数不足 -> 明确跳过（旧版固定5折CV按会话泄漏且小样本崩溃，已废除）
+        if validation is not None:
+            from sklearn.metrics import f1_score
+            X_val, y_val = validation
+            pred = self.classifier.predict(
+                X_val[selected_features].fillna(0))
+            print(f"  [规则生成] XGBoost 验证集 Macro-F1: "
+                  f"{f1_score(y_val, pred, average='macro', zero_division=0):.4f}"
+                  f"（离线对照，非规则DPI成绩；验证集不参与拟合）")
+        elif groups is not None:
+            from sklearn.metrics import f1_score
+            from sklearn.model_selection import GroupKFold, cross_val_predict
+            g = pd.Series(list(groups)).reset_index(drop=True)
+            n_groups = int(g.nunique())
+            n_splits = min(5, n_groups)
+            # 组-类完全重合守卫：每个采集组只含一个类时，任何组折的训练集
+            # 都是单类，CV不可拟也不可信（常见于 fixture：组=类）
+            group_class_overlap = all(
+                y[g == gv].nunique() > 1 for gv in g.unique())
+            if n_splits >= 2 and group_class_overlap:
+                try:
+                    gkf = GroupKFold(n_splits=n_splits)
+                    pred = cross_val_predict(
+                        self.classifier, X_sel, y, groups=g, cv=gkf)
+                    print(f"  [规则生成] XGBoost GroupKFold({n_splits}折,"
+                          f"{n_groups}采集组) Macro-F1: "
+                          f"{f1_score(y, pred, average='macro', zero_division=0):.4f}"
+                          f"（离线对照，非规则DPI成绩）")
+                except Exception as _e:  # noqa: BLE001
+                    print(f"  [规则生成] CV对照执行失败已跳过: {_e}")
+            else:
+                why = (f"采集组仅{n_groups}组" if n_splits < 2
+                       else "采集组与类别完全重合（组折训练集单类）")
+                print(f"  [规则生成] 跳过CV对照：{why}"
+                      f"（不按会话随机折防泄漏）")
+        else:
+            print("  [规则生成] 跳过CV对照：未提供验证集/采集组"
+                  "（不按会话随机折防泄漏）")
 
         # 2. 提取特征重要性
         importances = dict(zip(selected_features, self.classifier.feature_importances_))
@@ -83,10 +153,13 @@ class OptimizedRuleGenerator:
         rules.append(self._create_ensemble_rule(selected_features, importances))
 
         # 方式B：从XGBoost训练的浅层决策树中提取可解释规则
-        tree_rules = self._extract_tree_rules(X_sel, y, selected_features, label_names)
+        # （树条件只用训练内完全present的特征——训练fillna(0)造出的阈值
+        #   与推理缺失即不匹配的语义不一致，2026-09-18 第二轮修复）
+        tree_rules = self._extract_tree_rules(X, y, selected_features, label_names)
         rules.extend(tree_rules)
 
-        # 方式C：统计阈值规则（每个类别的特征范围）
+        # 方式C：统计阈值规则（每个类别的特征范围；
+        #   confidence=train precision，零覆盖死规则不部署）
         stat_rules = self._generate_statistical_rules(X, y, selected_features, label_names)
         rules.extend(stat_rules)
 
@@ -259,19 +332,61 @@ class OptimizedRuleGenerator:
     def _extract_tree_rules(self, X: pd.DataFrame, y: pd.Series,
                             features: List[str],
                             label_names: Dict[int, str]) -> List[Dict]:
-        """从浅层决策树提取可解释规则"""
+        """从浅层决策树提取可解释规则。
+
+        - 参数自适应小样本（_adaptive_tree_params）；
+        - tree_class_weight='balanced' 时以类权重拟合分裂（第三轮候选）；
+        - 导出规则的 confidence 一律为"未加权训练回放的真实precision"：
+          加权树的叶纯度（sklearn加权value）只作 leaf_purity 元数据，
+          不得冒充 precision（计划 S2.3）；
+        - 条件特征只在"训练行完全present（无NaN）"的特征里选：训练侧
+          fillna(0) 会造出"缺失=0"的阈值，而推理侧特征缺失=规则不匹配
+          （R22 严格语义），两侧语义必须一致——缺特征的特征不进规则，
+          而不是靠0填对齐（2026-09-18 第二轮）。
+        """
         from sklearn.tree import DecisionTreeClassifier
 
+        usable = [f for f in features
+                  if f in X.columns and not X[f].isna().any()]
+        if not usable:
+            return []
+        depth, leaf = self._adaptive_tree_params(len(X), y.nunique())
         tree = DecisionTreeClassifier(
-            max_depth=5, min_samples_leaf=5, random_state=42
+            max_depth=depth, min_samples_leaf=leaf, random_state=42,
+            class_weight=self.tree_class_weight
         )
-        tree.fit(X, y)
+        tree.fit(X[usable].fillna(0), y)
 
         tree_model = tree.tree_
         rules = []
         # R31: 传入树自身classes_，叶标签按真实类别值解析（支持字符串/非连续ID）
-        self._traverse_tree(tree_model, 0, features, label_names, rules, [], tree.classes_)
-        return rules
+        self._traverse_tree(tree_model, 0, usable, label_names, rules, [], tree.classes_)
+        # 真实未加权回放统计：confidence/train_precision/coverage（加权树
+        # 的叶纯度不可冒充 precision）；零命中死规则剔除（与STAT一致）
+        name_to_id = {v: k for k, v in label_names.items()}
+        kept = []
+        for r in rules:
+            covered = pd.Series(True, index=X.index)
+            for c in r['conditions']:
+                col = X[c['feature']]
+                if c['op'] == '<=':
+                    covered &= (col <= c['value'])
+                else:
+                    covered &= (col > c['value'])
+            n_fire = int(covered.sum())
+            if n_fire == 0:
+                continue
+            lid = name_to_id.get(r['action']['result'])
+            precision = float((y[covered] == lid).mean()) if lid is not None else 0.0
+            coverage = float(covered[y == lid].mean()) if lid is not None else 0.0
+            r['leaf_purity'] = r.pop('confidence')
+            r['confidence'] = precision
+            r['train_precision'] = round(precision, 4)
+            r['train_coverage'] = round(coverage, 4)
+            r['n_train_fires'] = n_fire
+            r['action']['confidence'] = precision
+            kept.append(r)
+        return kept
 
     def _traverse_tree(self, tree, node_id, features, label_names, rules, conditions,
                         classes=None):
@@ -313,19 +428,34 @@ class OptimizedRuleGenerator:
     def _generate_statistical_rules(self, X: pd.DataFrame, y: pd.Series,
                                      features: List[str],
                                      label_names: Dict[int, str]) -> List[Dict]:
-        """基于统计的特征范围规则"""
+        """基于统计的特征范围规则。
+
+        语义修复（2026-09-18 第二轮）：
+        - confidence = train precision（该规则在训练集上命中时的类别纯度），
+          不再是 class coverage（召回）——引擎/报告消费的是"命中可信度"，
+          召回语义既误导阈值判断也压低真实可信规则；
+        - train_coverage 与 train_precision 一并写入规则元数据；
+        - 零覆盖规则（在训练集上一次都不命中）不再部署（死规则只会
+          在未知数据上盲发预测）；
+        - 条件特征只在训练行完全present的特征里选（缺特征不靠0填造
+          范围，与推理缺失即不匹配一致）。
+        """
         rules = []
+        usable = [f for f in features
+                  if f in X.columns and not X[f].isna().any()]
+        if not usable:
+            return rules
 
         for label_id, label_name in label_names.items():
             mask = y == label_id
             if mask.sum() < 3:
                 continue
 
-            X_class = X[features][mask].fillna(0)
-            X_other = X[features][~mask].fillna(0)
+            X_class = X[usable][mask]
+            X_other = X[usable][~mask]
 
             conditions = []
-            for feat in features:
+            for feat in usable:
                 class_vals = X_class[feat]
                 other_vals = X_other[feat]
 
@@ -351,13 +481,19 @@ class OptimizedRuleGenerator:
                     break
 
             if len(conditions) >= 2:
-                # 计算覆盖率
-                covered = pd.Series(True, index=X_class.index)
+                # 训练集回放：coverage（类内命中比例）与 precision（命中纯度）
+                covered = pd.Series(True, index=X.index)
                 for cond in conditions:
-                    if cond['feature'] in X_class.columns:
-                        covered &= (X_class[cond['feature']] >= cond['min'])
-                        covered &= (X_class[cond['feature']] <= cond['max'])
-                coverage = covered.mean()
+                    covered &= (X[cond['feature']] >= cond['min'])
+                    covered &= (X[cond['feature']] <= cond['max'])
+                n_fire = int(covered.sum())
+                coverage = float(covered[mask].mean()) if mask.sum() else 0.0
+                precision = (float((y[covered] == label_id).mean())
+                             if n_fire else 0.0)
+                if n_fire == 0:
+                    continue          # 零覆盖死规则不部署
+                if precision < self.min_confidence:
+                    continue          # 命中纯度低于配置下限不部署
 
                 rules.append({
                     'id': f'STAT_{len(rules)+1:04d}',
@@ -366,9 +502,11 @@ class OptimizedRuleGenerator:
                     'app': self._extract_app_name(label_name),
                     'behavior': self._extract_behavior_name(label_name),
                     'priority': 200,
-                    'confidence': float(coverage),
+                    'confidence': float(precision),
+                    'train_coverage': round(coverage, 4),
+                    'train_precision': round(precision, 4),
                     'conditions': conditions,
-                    'action': {'result': label_name, 'confidence': float(coverage), 'source': 'statistical'}
+                    'action': {'result': label_name, 'confidence': float(precision), 'source': 'statistical'}
                 })
 
         return rules
